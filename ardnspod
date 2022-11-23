@@ -121,14 +121,20 @@ arDdnsApi() {
     local dnsapi="https://dnsapi.cn/${1:?'Info.Version'}"
     local params="login_token=$arToken&format=json&lang=en&$2"
 
+    local output
     if type curl >/dev/null 2>&1; then
-        curl -4 -s -A $agent -d $params $dnsapi
+        arLog "> arDdnsApi - calling curl"
+        output=$(curl -4 -s -A $agent -d $params $dnsapi 2>&1)
     elif ! wget --help 2>&1 | grep -qs BusyBox; then
-        wget -4 -q -O- --no-check-certificate -U $agent --post-data $params $dnsapi
+        arLog "> arDdnsApi - calling GNU Wget"
+        output=$(wget -4 -q -O- --no-check-certificate -U $agent --post-data $params $dnsapi 2>&1)
     else
-        wget -q -O- --no-check-certificate -U $agent --post-data $params $dnsapi
+        arLog "> arDdnsApi - calling BusyBox Wget"
+        output=$(wget -q -O- --no-check-certificate -U $agent --post-data $params $dnsapi 2>&1)
     fi
 
+    arLog "> arDdnsApi - dnsapi output: $output"
+    echo "$output"
 }
 
 # Fetch Record Id
@@ -141,14 +147,18 @@ arDdnsLookup() {
     local recordId
 
     # Get Record Id
+    arLog "> arDdnsLookup - before calling arDdnsApi"
     recordId=$(arDdnsApi "Record.List" "domain=$1&sub_domain=$2&record_type=$3")
+    arLog "> arDdnsLookup - after calling arDdnsApi, recordId: $recordId"
     recordId=$(echo $recordId | sed 's/.*"id":"\([0-9]*\)".*/\1/')
+    arLog "> arDdnsLookup - recordId: $recordId"
 
     if ! [ "$recordId" -gt 0 ] 2>/dev/null ;then
         errMsg=$(echo $recordId | sed 's/.*"message":"\([^\"]*\)".*/\1/')
-        arLog "> arDdnsLookup - $errMsg"
+        arLog "> arDdnsLookup error - $errMsg"
         return 1
     fi
+    arLog "> arDdnsLookup success - $recordId"
 
     echo $recordId
 }
@@ -250,7 +260,7 @@ arDdnsCheck() {
     recordId=$(arDdnsLookup "$1" "$2" "$recordType")
 
     if [ $? -ne 0 ]; then
-        arLog $recordId
+        arLog "> arDdnsLookup failed $recordId"
         return 1
     else
         arLog "> Record Id: $recordId"
