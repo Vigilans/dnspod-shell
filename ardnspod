@@ -254,6 +254,163 @@ arDevIp6() {
 
 }
 
+# Get IPv6 of a neighbor from a specific interface by its MAC address
+# Args: interface mac
+
+arLinkIp6() {
+
+    local hostIp
+
+    local lanIps=$(arLanIp6)
+
+    case $(uname) in
+        'Linux')
+            ### 1. Refresh neighbor table
+            # Derive a list of possible public IPv6 addresses as candidates
+            local neighborIps=$(ip -o -6 neigh show dev $1 | grep "lladdr $2" | awk '{print $1}')
+
+            # Extract all prefixes and interface identifiers from candidates
+            local prefixes=$(echo "$neighborIps" | arPrefixIp6)
+            local ifaceIds=$(echo "$neighborIps" | arIdentifierIp6)
+
+            # Extend prefixes and interface identifiers
+            prefixes=$(printf "%s\n%s" "$prefixes" "$(echo $1 | arNicPrefixesIp6)") # Append prefixes from host's interface
+            ifaceIds=$(printf "%s\n%s" "$ifaceIds" "$(echo $2 | arMacEuiIp6 1)")   # Append flipped EUI-64 from MAC address
+
+            # Do a batch ping requests over the combinations of prefixes and interface identifiers for at most 5 seconds
+            # This enforces refreshing of states in the neighbor discovery cache. Related state transitions:
+            #  * Ping packet sent: REACHABLE -> REACHABLE, DELAY -> DELAY, STALE -> DELAY, PROBE -> PROBE
+            #  * Ping packet recv: REACHABLE -> REACHABLE, DELAY -> DELAY or REACHABLE, PROBE -> PROBE or REACHABLE
+            #  * Ping packet fail: REACHABLE -> PROBE, DELAY -> PROBE, PROBE -> PROBE or DELETED (PROBE needs 5 seconds of no response)
+            # Therefore, we need both REACHABLE and DELAY for available IPv6 address, and use 5s timeout to force unresponded DELAY address becomes PROBE.
+            arLog "> arLinkIp6 - Ping candidate ips for at most 5 seconds"
+            local prefix ifaceId
+            for prefix in $(echo "$prefixes" | sort | uniq); do
+                for ifaceId in $(echo "$ifaceIds" | sort | uniq); do
+                    arLog "> arLinkIp6 - $prefix:$ifaceId"
+                    ping -I $1 -c 1 -W 5 "$prefix:$ifaceId" 1>/dev/null 2>&1 &
+                done
+            done
+            wait # Wait for all ping requests to finish (at most 5 seconds)
+
+            ### 2. Derive hostIp
+            # Pick all IPv6 addresses in REACHABLE or DELAY (because a successful ping response is received during DELAY) state
+            local availableNeighbor=$(ip -o -6 neigh show dev $1 nud reachable nud delay | grep "lladdr $2" | awk '{print $1}')
+
+            # Collect deprecated prefixes and interface identifiers of link-local (fe80::/10) and unique-local (fc00::/7) addresses for filtering out better hostIp
+            local deprecatePrefixes=$(ip -o -6 addr show dev $1 scope global deprecated | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | arPrefixIp6 | tr '\n' '|' | sed 's/|$/\n/')
+            local linkLocalIfaceIds=$(echo "$availableNeighbor" | grep -E "^[fF][eE][8-9a-fA-F]" | arIdentifierIp6 | sort | uniq | tr '\n' '|' | sed 's/|$/\n/')
+            local uniqLocalIfaceIds=$(echo "$availableNeighbor" | grep -E "^[fF][cdCD]" | arIdentifierIp6 | sort | uniq | tr '\n' '|' | sed 's/|$/\n/')
+
+            # Pick all public non-deprecated ipv6 addresses
+            local publicIps=$(echo "$availableNeighbor" | arExpandIp6 | grep -Ev "$lanIps")
+            if [ -n "$deprecatePrefixes" ]; then
+                publicIps=$(echo "$publicIps" | grep -Ev "$deprecatePrefixes")
+            fi
+
+            # Select a public ipv6 address according a specific order of preferences
+            if [ -n "$uniqLocalIfaceIds" ]; then # Prefer public address that has the same interface id as unique-local ones (since it may derive from DHCPv6)
+                hostIp=$(echo "$publicIps" | grep -E "$uniqLocalIfaceIds" | head -n 1)
+            fi
+            if [ -z "$hostIp" ] && [ -n "$linkLocalIfaceIds" ]; then # Try address that has the same interface id as link-local ones (since it dervies from SLAAC, which is non-temporary)
+                hostIp=$(echo "$publicIps" | grep -E "$linkLocalIfaceIds" | head -n 1)
+            fi
+            if [ -z "$hostIp" ]; then # Use first available address sorted by interface id from lower to higher (since shorter ones may be assigned by DHCPv6, which is relatively non-temporary)
+                hostIp=$(echo "$publicIps" | sort | head -n 1)
+            fi
+            hostIp=$(echo "$hostIp" | arCompressIp6)
+        ;;
+    esac
+
+    if [ -z "$hostIp" ]; then
+        arLog "> arLinkIp6 - Can't get ip address from $2"
+        return 1
+    fi
+
+    if [ -z "$(echo $hostIp | grep -E '^[0-9a-fA-F:]+$')" ]; then
+        arLog "> arLinkIp6 - Invalid ip address"
+        return 1
+    fi
+
+    echo $hostIp
+
+}
+
+# Convert any IPv6 address to expanded form (address string of fixed length 39)
+# Stdin: ipv6
+
+arExpandIp6() {
+    while read ip && test -n "$ip"; do
+        # prepend 0 if start with :
+        echo $ip | grep -qs "^:" && ip="0${ip}"
+
+        # expand ::
+        if echo $ip | grep -qs "::"; then
+            local colons=$(echo $ip | sed 's/[^:]//g')
+            local expanded=$(echo ":::::::::" | sed -e "s/$colons//" -e 's/:/:0/g')
+            ip=$(echo $ip | sed "s/::/$expanded/")
+        fi
+
+        # format as full ipv6 address form and output
+        echo $ip | grep -o "[0-9a-f]\+" | awk '{ print "0x"$0 }' | xargs printf "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x\n"
+    done
+}
+
+# Convert expanded IPv6 address back to normal compressed form
+# Stdin: ipv6
+
+arCompressIp6() {
+    while read ip && test -n "$ip"; do
+        # compress leading zeros, and prepend : for easier matching
+        ip=$(echo $ip | grep -o "[0-9a-f]\+" | awk '{ print "0x"$0 }' | xargs printf ":%x:%x:%x:%x:%x:%x:%x:%x\n")
+
+        # compress consecutive zeros (:: must compress the longest chain)
+        for pattern in 0:0:0:0:0:0:0:0 :0:0:0:0:0:0:0 :0:0:0:0:0:0 :0:0:0:0:0 :0:0:0:0 :0:0:0 :0:0; do
+            if echo $ip | grep -qs $pattern; then
+                ip=$(echo $ip | sed "s/$pattern/::/")
+                break
+            fi
+        done
+
+        # remove prepending :, then correct ::: to :: and output
+        echo $ip | sed -e 's/^://' -e 's/:::/::/'
+    done
+}
+
+# Obtain the prefix part (the former 64 bit) of an IPv6 address
+# Stdin: ipv6
+
+arPrefixIp6() {
+    arExpandIp6 | grep -oE '^[0-9a-f:]{19}'
+}
+
+# Obtain the interface identifier part (the latter 64 bit) of an IPv6 address
+# Stdin: ipv6
+
+arIdentifierIp6() {
+    arExpandIp6 | grep -oE '[0-9a-f:]{19}$'
+}
+
+# Obtain all IPv6 prefixes bound to a specific network interface
+# Args: exclude_regex (optional regex to filter the result, e.g. lanIps)
+# Stdin: interface
+
+arNicPrefixesIp6() {
+    [ -n "$1" ] || set "^$" # Do not filter if no argument passed
+    tr '\n' '\0' | xargs -0 -n1 ip -o -6 route show dev | awk '{print $1}' | grep -E "(/[1-5]?[0-9])|(/6[0-4])$" | awk -F/ '{print $1}' | grep -Ev "$1" | arPrefixIp6 | sort | uniq
+}
+
+# Generate an IPv6 EUI-64 interface identifier from MAC address
+# Args: flip_ubit (whether to flip 7th bit of first byte, the universal/local bit)
+# Stdin: mac
+
+arMacEuiIp6() {
+    local aa bb cc dd ee ff
+    while IFS=: read aa bb cc dd ee ff; do
+        printf "%02x%02x:%02xff:fe%02x:%02x%02x\n" $((0x$aa ^ (0x02*$1))) 0x$bb 0x$cc 0x$dd 0x$ee 0x$ff
+    done
+}
+
 ################################################################### dnspod api ##
 
 # Dnspod Bridge
@@ -366,7 +523,10 @@ arDdnsCheck() {
     arLog "=== Check $2.$1 ==="
     arLog "Fetching Host Ip"
 
-    if   [ "$3" = "6" ] && [ -n "$4" ]; then
+    if   [ "$3" = "6" ] && [ -n "$4" ] && [ -n "$5" ]; then
+        recordType=AAAA
+        hostIp=$(arLinkIp6 "$4" "$5")
+    elif [ "$3" = "6" ] && [ -n "$4" ]; then
         recordType=AAAA
         hostIp=$(arDevIp6 "$4")
     elif [ "$3" = "4" ] && [ -n "$4" ]; then
